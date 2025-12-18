@@ -1,0 +1,10 @@
+# DO NOT UPLOAD DATA
+*.csv
+*.xlsx
+
+# python cache
+__pycache__/
+*.pyc
+
+# mac
+.DS_Store
