@@ -97,8 +97,8 @@ def infer_feature_order(model, meta: dict):
     """
     Try (in order):
       1) model.feature_names_in_ (sklearn)
-      2) meta['feature_names'] / meta['feature_order']
-      3) fallback hardcoded order
+      2) meta['feature_names'] / meta['feature_order'] / meta['features']
+      3) fallback hardcoded order (your current UI fields)
     """
     if hasattr(model, "feature_names_in_"):
         names = list(getattr(model, "feature_names_in_"))
@@ -108,14 +108,11 @@ def infer_feature_order(model, meta: dict):
     for k in ["feature_names", "feature_order", "features"]:
         if k in meta:
             if isinstance(meta[k], list) and meta[k]:
-                # meta["features"] might be list of dicts
                 if isinstance(meta[k][0], dict) and "name" in meta[k][0]:
                     return [d["name"] for d in meta[k]]
-                # meta["feature_names"] might be list of strings
                 if isinstance(meta[k][0], str):
                     return meta[k]
 
-    # Fallback: your current app fields
     return ["Age", "AST_ALT", "ALB", "LDH_U_L", "D_DI", "Past_embolism", "Staphylococcus_aureus"]
 
 
@@ -124,7 +121,6 @@ def proba_of_positive_class(model, X: pd.DataFrame) -> float:
     Robustly pick P(y=1).
     """
     proba = model.predict_proba(X)
-    # If model has classes_, choose class==1; else assume column 1 is positive
     if hasattr(model, "classes_"):
         classes = list(model.classes_)
         if 1 in classes:
@@ -169,56 +165,65 @@ with st.form("risk_form", clear_on_submit=False):
 # Prediction
 # ----------------------------
 if submitted:
-    try:
-        age = parse_positive_float(age_raw, "Age")
-        astalt = parse_positive_float(astalt_raw, "AST/ALT ratio")
-        alb = parse_positive_float(alb_raw, "Albumin")
-        ldh = parse_positive_float(ldh_raw, "LDH")
-        ddi = parse_positive_float(ddi_raw, "D-dimer")
+    # 先做缺失检查：不要在 try 里 st.stop()，避免被 except 抓住造成“假报错”
+    missing = []
+    if str(age_raw).strip() == "":
+        missing.append("Age")
+    if str(astalt_raw).strip() == "":
+        missing.append("AST/ALT ratio")
+    if str(alb_raw).strip() == "":
+        missing.append("Albumin")
+    if str(ldh_raw).strip() == "":
+        missing.append("LDH")
+    if str(ddi_raw).strip() == "":
+        missing.append("D-dimer")
+    if past is None:
+        missing.append("Past embolism (Yes/No)")
+    if staph is None:
+        missing.append("Staphylococcus aureus (Yes/No)")
 
-        # Required checks (keep it strict and clear)
-        missing = []
-        if age is None: missing.append("Age")
-        if astalt is None: missing.append("AST/ALT ratio")
-        if alb is None: missing.append("Albumin")
-        if ldh is None: missing.append("LDH")
-        if ddi is None: missing.append("D-dimer")
-        if past is None: missing.append("Past embolism (Yes/No)")
-        if staph is None: missing.append("Staphylococcus aureus (Yes/No)")
+    if missing:
+        st.error("Please fill in: " + ", ".join(missing))
+    else:
+        try:
+            age = parse_positive_float(age_raw, "Age")
+            astalt = parse_positive_float(astalt_raw, "AST/ALT ratio")
+            alb = parse_positive_float(alb_raw, "Albumin")
+            ldh = parse_positive_float(ldh_raw, "LDH")
+            ddi = parse_positive_float(ddi_raw, "D-dimer")
 
-        if missing:
-            st.error("Please fill in: " + ", ".join(missing))
-            st.stop()
+            row = {
+                "Age": age,
+                "AST_ALT": astalt,
+                "ALB": alb,
+                "LDH_U_L": ldh,
+                "D_DI": ddi,
+                "Past_embolism": past,
+                "Staphylococcus_aureus": staph,
+            }
 
-        row = {
-            "Age": age,
-            "AST_ALT": astalt,
-            "ALB": alb,
-            "LDH_U_L": ldh,
-            "D_DI": ddi,
-            "Past_embolism": past,
-            "Staphylococcus_aureus": staph,
-        }
+            # Build X with the exact feature order expected by the model
+            X = pd.DataFrame([{name: row.get(name, np.nan) for name in feature_order}])
 
-        # Build X with the exact feature order expected by the model
-        X = pd.DataFrame([{name: row.get(name, np.nan) for name in feature_order}])
+            # If any NaN remains -> UI/model feature name mismatch
+            if X.isna().any().any():
+                bad_cols = X.columns[X.isna().any()].tolist()
+                st.error(
+                    "Feature mismatch between UI and model. Missing columns: "
+                    + ", ".join(bad_cols)
+                    + ". Check meta.json / model feature names."
+                )
+            else:
+                risk = proba_of_positive_class(model, X)
 
-        # Safety: if any NaN remains, fail loudly (means feature name mismatch)
-        if X.isna().any().any():
-            bad_cols = X.columns[X.isna().any()].tolist()
-            st.error(
-                "Feature mismatch between UI and model. Missing columns: "
-                + ", ".join(bad_cols)
-                + ".\n\nCheck meta.json / model feature names."
-            )
-            st.stop()
+                st.markdown("---")
+                st.metric("Estimated risk (probability)", f"{risk * 100:.1f}%")
+                st.caption(
+                    "Note: This calculator is for research/educational use only and does not replace clinical judgment."
+                )
 
-        risk = proba_of_positive_class(model, X)
-
-        st.markdown("---")
-        st.metric("Estimated risk (probability)", f"{risk*100:.1f}%")
-
-        st.caption("Note: This calculator is for research/educational use only and does not replace clinical judgment.")
-
-    except Exception as e:
-        st.error(str(e))
+        except Exception as e:
+            # 避免把 Streamlit 的内部“停止执行”当成错误（不同版本类名可能不同）
+            if e.__class__.__name__ in ("StopException", "RerunException"):
+                raise
+            st.error(str(e))
